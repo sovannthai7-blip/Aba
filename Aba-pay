@@ -1,0 +1,334 @@
+// ============================================================
+//  PUTTHAI Bot + ABA Payment — Cloudflare Worker v3.0 Final
+//  Based on v2.7 logic + official SDK field order
+//  ABA: HMAC-SHA512, Public Key, /purchase endpoint
+//
+//  Cloudflare Secrets:
+//    ABA_MERCHANT_ID  = ec475678
+//    ABA_SECRET_KEY   = 449cc8d6590c74030c2192043168dbb97f1a4b3f
+//    ABA_CALLBACK_URL = https://putthai-pay.sovannthai7.workers.dev/aba-webhook
+//    BOT_TOKEN, ADMIN_CHAT_ID, FIREBASE_PROJECT, FIREBASE_KEY, OWNER_UID
+// ============================================================
+
+const ABA_API_URL = 'https://checkout-sandbox.payway.com.kh/api/payment-gateway/v1/payments/purchase';
+
+// ── CORS ─────────────────────────────────────────────────────
+function corsHeaders() {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
+  };
+}
+function jsonResp(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() }
+  });
+}
+
+// ── req_time: YYYYMMDDHHmmss UTC ─────────────────────────────
+function buildReqTime() {
+  const d = new Date();
+  const p = n => n.toString().padStart(2, '0');
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth()+1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
+// ── tran_id ≤20 chars alphanumeric ───────────────────────────
+function buildTranId(invoiceNumber) {
+  if (invoiceNumber) {
+    const clean = invoiceNumber.replace(/[^a-zA-Z0-9]/g, '').substring(0, 20);
+    if (clean.length >= 4) return clean;
+  }
+  return ('INV' + Date.now().toString().slice(-10)).substring(0, 20);
+}
+
+// ── formatAmount: USD=toFixed(2), KHR=integer ────────────────
+function formatAmount(amount, currency = 'USD') {
+  if (currency === 'KHR') return Math.round(amount).toString();
+  return parseFloat(amount).toFixed(2);
+}
+
+// ── Hash string field order (per ABA SDK) ────────────────────
+function buildHashString(p) {
+  return [
+    p.req_time        || '',
+    p.merchant_id     || '',
+    p.tran_id         || '',
+    p.amount          || '',   // string toFixed(2)
+    p.items           || '',   // base64 or ''
+    p.first_name      || '',
+    p.last_name       || '',
+    p.email           || '',
+    p.phone           || '',
+    p.purchase_type   || '',
+    p.payment_option  || '',
+    p.callback_url    || '',   // base64
+    p.return_deeplink || '',
+    p.currency        || '',
+    p.custom_fields   || '',
+    p.return_params   || '',
+    p.payout          || '',
+    String(p.lifetime || ''), // string
+    p.qr_image_template || '',
+  ].join('');
+}
+
+// ── HMAC-SHA512 + Base64 ──────────────────────────────────────
+async function generateHash(str, apiKey) {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(apiKey),
+    { name: 'HMAC', hash: 'SHA-512' },
+    false, ['sign']
+  );
+  const sig   = await crypto.subtle.sign('HMAC', key, enc.encode(str));
+  const bytes = new Uint8Array(sig);
+  let bin = '';
+  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
+}
+
+// ── safeFetch with timeout ────────────────────────────────────
+async function safeFetch(url, options = {}, timeout = 15000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try { return await fetch(url, { ...options, signal: controller.signal }); }
+  finally { clearTimeout(id); }
+}
+
+// ── escapeHtml ────────────────────────────────────────────────
+function escapeHtml(str = '') {
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ============================================================
+//  POST /generate-qr
+// ============================================================
+async function handleGenerateQR(request, env) {
+  try {
+    const body = await request.json();
+    const { invoiceNumber, amount, currency, customerName, phone } = body;
+
+    if (!invoiceNumber || !amount) return jsonResp({ error: 'Missing params' }, 400);
+
+    const MERCHANT_ID = env.ABA_MERCHANT_ID || '';
+    const API_KEY     = env.ABA_SECRET_KEY  || '';
+    if (!MERCHANT_ID) return jsonResp({ error: 'ABA_MERCHANT_ID missing' }, 500);
+    if (!API_KEY)     return jsonResp({ error: 'ABA_SECRET_KEY missing' }, 500);
+
+    const req_time = buildReqTime();
+    const tran_id  = buildTranId(invoiceNumber);
+    const curr     = currency || 'USD';
+    const amt      = formatAmount(amount, curr); // string
+
+    // items = base64(JSON array)
+    const itemsArr = JSON.stringify([{
+      name: 'Invoice ' + invoiceNumber, quantity: 1, price: parseFloat(amt)
+    }]);
+    const items = btoa(itemsArr);
+
+    // callback_url = base64(URL)
+    const callbackRaw = env.ABA_CALLBACK_URL || 'https://putthai-pay.sovannthai7.workers.dev/aba-webhook';
+    const callback    = btoa(callbackRaw);
+    const returnUrl   = env.ABA_RETURN_URL || '';
+
+    const payload = {
+      req_time,
+      merchant_id:       MERCHANT_ID,
+      tran_id,
+      first_name:        customerName || '',
+      last_name:         '',
+      email:             '',
+      phone:             phone || '',
+      amount:            amt,        // string for hash + request
+      purchase_type:     'purchase',
+      payment_option:    'abapay_khqr',
+      items,
+      currency:          curr,
+      callback_url:      callback,
+      return_deeplink:   null,
+      custom_fields:     null,
+      return_params:     null,
+      payout:            null,
+      lifetime:          30,
+      qr_image_template: 'template3_color',
+      return_url:        returnUrl ? btoa(returnUrl) : undefined,
+    };
+
+    const hashStr    = buildHashString(payload);
+    payload.hash     = await generateHash(hashStr, API_KEY);
+
+    console.log('ABA QR tran_id:', tran_id, 'amount:', amt);
+
+    const resp = await safeFetch(ABA_API_URL, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload)
+    });
+
+    const data = await resp.json();
+    console.log('ABA Response code:', data.status?.code, 'msg:', data.status?.message);
+
+    return jsonResp({
+      success:   data.status?.code === '0',
+      tran_id,
+      qr_image:  data.qrImage  || null,
+      qr_string: data.qrString || null,
+      status:    data.status   || null,
+    });
+
+  } catch(e) {
+    console.error('GenerateQR error:', e.message);
+    return jsonResp({ error: e.message }, 500);
+  }
+}
+
+// ============================================================
+//  POST /aba-webhook
+// ============================================================
+async function handleABAWebhook(request, env) {
+  try {
+    let rawBody = '';
+    let body = {};
+    try {
+      rawBody = await request.text();
+      try { body = JSON.parse(rawBody); }
+      catch { const p = new URLSearchParams(rawBody); for (const [k,v] of p) body[k] = v; }
+    } catch(e) {}
+
+    console.log(JSON.stringify({ type:'aba_webhook', tran_id:body.tran_id||'', status:body.status||'', amount:body.amount||'' }));
+
+    // ── Verify ABA webhook signature ──────────────────────────
+    const receivedSig = request.headers.get('x-payway-hmac-sha512') || '';
+    if (receivedSig && env.ABA_SECRET_KEY) {
+      // Sort fields by key ascending → concat values → HMAC-SHA512
+      const sortedKeys = Object.keys(body).sort();
+      const strToSign  = sortedKeys.map(k => {
+        const v = body[k];
+        return typeof v === 'object' ? JSON.stringify(v) : String(v ?? '');
+      }).join('');
+      const expectedSig = await generateHash(strToSign, env.ABA_SECRET_KEY);
+      const clean = s => String(s||'').replace(/\s+/g,'').trim().toLowerCase();
+      if (clean(receivedSig) !== clean(expectedSig)) {
+        console.warn('Invalid ABA webhook signature');
+        return jsonResp({ ok: true, action: 'invalid_signature' });
+      }
+    }
+
+    const status  = String(body.status || '').toLowerCase().trim();
+    const tran_id = body.tran_id || '';
+    const amount  = body.amount  || '';
+
+    const okSet = new Set(['0','00','success','successful','completed','approved']);
+    if (!okSet.has(status)) return jsonResp({ ok: true, action: 'ignored', status });
+
+    const PROJ = env.FIREBASE_PROJECT || '';
+    const FKEY = env.FIREBASE_KEY     || '';
+    const UID  = env.OWNER_UID        || '';
+
+    const docUrl  = `https://firestore.googleapis.com/v1/projects/${PROJ}/databases/(default)/documents/users/${UID}?key=${FKEY}`;
+    const docResp = await safeFetch(docUrl);
+    if (!docResp.ok) throw new Error(`Firestore read: ${docResp.status}`);
+    const doc = await docResp.json();
+
+    const invArr = doc.fields?.invoices?.arrayValue?.values || [];
+    let found = -1;
+    invArr.forEach((v, i) => {
+      const f   = v.mapValue?.fields || {};
+      const num = f.number?.stringValue || '';
+      const tid = f.tranId?.stringValue || f.abaTranId?.stringValue || '';
+      if (tid === tran_id || num === tran_id || num.replace(/[^a-zA-Z0-9]/g,'') === tran_id) found = i;
+    });
+
+    if (found < 0) return jsonResp({ ok: true, action: 'not_found', tran_id });
+    if (invArr[found].mapValue?.fields?.status?.stringValue === 'paid') return jsonResp({ ok: true, action: 'already_paid' });
+
+    invArr[found].mapValue.fields.status     = { stringValue: 'paid' };
+    invArr[found].mapValue.fields.paidAt     = { stringValue: new Date().toISOString() };
+    invArr[found].mapValue.fields.paidAmount = { doubleValue: parseFloat(amount) || 0 };
+    invArr[found].mapValue.fields.payMethod  = { stringValue: 'ABA PayWay' };
+    invArr[found].mapValue.fields.tranId     = { stringValue: tran_id };
+
+    const patchUrl = `https://firestore.googleapis.com/v1/projects/${PROJ}/databases/(default)/documents/users/${UID}?updateMask.fieldPaths=invoices&key=${FKEY}`;
+    const patchResp = await safeFetch(patchUrl, {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ fields: { invoices: { arrayValue: { values: invArr } } } })
+    });
+    if (!patchResp.ok) throw new Error(`Firestore patch: ${patchResp.status}`);
+
+    const TG = env.BOT_TOKEN || '';
+    const TC = env.ADMIN_CHAT_ID || '';
+    if (TG && TC) {
+      const inv = invArr[found].mapValue?.fields || {};
+      await safeFetch(`https://api.telegram.org/bot${TG}/sendMessage`, {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ chat_id:TC, text:`💰 ABA Payment!\n📄 ${inv.number?.stringValue||tran_id}\n💵 $${amount}\n✅ Paid`, disable_web_page_preview:true })
+      }).catch(() => {});
+    }
+
+    return jsonResp({ ok: true, action: 'paid', tran_id });
+
+  } catch(e) {
+    console.error('Webhook error:', e.message);
+    return jsonResp({ ok: true, action: 'error_logged' });
+  }
+}
+
+// ============================================================
+//  POST /telegram (default)
+// ============================================================
+async function handleTelegram(request, env) {
+  const TG   = env.BOT_TOKEN        || '';
+  const ADMC = env.ADMIN_CHAT_ID    || '';
+  const PROJ = env.FIREBASE_PROJECT || '';
+  const FKEY = env.FIREBASE_KEY     || '';
+
+  async function send(cid, txt) {
+    await safeFetch(`https://api.telegram.org/bot${TG}/sendMessage`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ chat_id:cid, text:txt, parse_mode:'HTML', disable_web_page_preview:true })
+    }).catch(() => {});
+  }
+
+  try {
+    const update  = await request.json();
+    const msg     = update.message;
+    if (!msg || update.edited_message) return new Response('OK');
+    const text      = (msg.text || '').trim();
+    const chatId    = String(msg.chat.id);
+    const firstName = msg.from?.first_name || 'Customer';
+    if (!text.startsWith('/start') || msg.from?.is_bot) return new Response('OK');
+    const rawCustId = text.split(' ')[1] || '';
+    if (rawCustId) {
+      const custId = rawCustId.startsWith('cust_') ? rawCustId : 'cust_' + rawCustId;
+      await safeFetch(`https://firestore.googleapis.com/v1/projects/${PROJ}/databases/(default)/documents/telegram_links/${chatId}?key=${FKEY}`, {
+        method:'PATCH', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ fields: { chatId:{stringValue:chatId}, custId:{stringValue:custId}, firstName:{stringValue:firstName}, linkedAt:{timestampValue:new Date().toISOString()} } })
+      }).catch(() => {});
+      await send(chatId, `✅ សូមស្វាគមន៍ <b>${escapeHtml(firstName)}</b>!\n\n🏠 <b>PUTTHAI Rental</b>\n📱 គណនីភ្ជាប់ជោគជ័យ!\n\n🙏 សូមអរគុណ!`);
+      await send(ADMC, `🔔 <b>អតិថិជន!</b>\n👤 ${escapeHtml(firstName)}\n📱 <code>${chatId}</code>\n🆔 ${custId}`);
+    } else {
+      await send(chatId, `🏠 សូមស្វាគមន៍ <b>${escapeHtml(firstName)}</b>!\n\n📱 Scan QR Code ពីវិក្កយបត្ររបស់អ្នក`);
+    }
+  } catch(e) { console.error('TG error:', e.message); }
+  return new Response('OK');
+}
+
+// ============================================================
+//  MAIN ROUTER
+// ============================================================
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === 'OPTIONS') return new Response(null, { headers: corsHeaders() });
+    if (url.pathname === '/health' && request.method === 'GET') {
+      return jsonResp({ status:'ok', worker:'putthai-aba-v3.2-pay', time:new Date().toISOString() });
+    }
+    if (url.pathname === '/generate-qr' && request.method === 'POST') return handleGenerateQR(request, env);
+    if ((url.pathname === '/aba-webhook' || url.pathname === '/aba-callback') && request.method === 'POST') return handleABAWebhook(request, env);
+    if (request.method === 'POST') return handleTelegram(request, env);
+    return new Response('Not found', { status: 404 });
+  }
+};
+
